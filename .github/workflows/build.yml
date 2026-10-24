@@ -364,6 +364,7 @@ jobs:
           import java.util.List;
           import java.util.Map;
           import java.util.UUID;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
           import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
           import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
           import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
@@ -385,6 +386,15 @@ jobs:
           /**
            * Серверная логика: когда игрок ломает руду, выпавшие предметы подменяются на переплавленные.
            *
+           * Совместимость с модами вида Vein Miner (добыча всей жилы за раз):
+           * <ul>
+           * <li>мы не трогаем ломание блоков и не используем миксины, поэтому нечему конфликтовать;</li>
+           * <li>перед КАЖДЫМ сломанным игроком блоком руды (в том числе внутри жилы) запоминаем его позицию;</li>
+           * <li>предмет подменяется в момент появления в мире, ещё до того, как другой мод успеет его подобрать
+           *     или перенести в инвентарь, поэтому переплавляется вся жила;</li>
+           * <li>в конце тика дополнительно проверяем свежие предметы вокруг (на случай, если дроп появился иначе);</li>
+           * <li>подмена идемпотентна: слиток повторно не обрабатывается, двойной переплавки быть не может.</li>
+           * </ul>
            * Настройки игроков приходят от клиента ({@link SettingsPayload}) и хранятся только в памяти:
            * клиент отправляет их заново при каждом входе в мир.
            */
@@ -392,13 +402,24 @@ jobs:
               private record Settings(boolean enabled, SmeltMode mode) {
               }
 
-              private record Pending(Level level, BlockPos pos) {
+              /** Позиции руды, которую игрок ломает в текущем тике. */
+              private static final class Armed {
+                  final Level level;
+                  final List<BlockPos> positions = new ArrayList<>();
+
+                  Armed(Level level) {
+                      this.level = level;
+                  }
               }
 
-              private static final Map<UUID, Settings> SETTINGS = new HashMap<>();
+              /** Максимум запомненных блоков на игрока за тик (защита от гигантских жил). */
+              private static final int MAX_POSITIONS = 1024;
 
-              /** Блоки, сломанные в этом тике: дроп подменяем ещё раз в конце тика (на случай, если он появился позже события). */
-              private static final List<Pending> PENDING = new ArrayList<>();
+              /** Радиус (в блоках), в котором предмет считается дропом от сломанной руды. */
+              private static final double DROP_RADIUS_SQ = 3.0 * 3.0;
+
+              private static final Map<UUID, Settings> SETTINGS = new HashMap<>();
+              private static final Map<UUID, Armed> ARMED = new HashMap<>();
 
               /** Что во что переплавляется. Руды с Silk Touch (сам блок руды) не трогаем. */
               private static final Map<Item, Item> SMELTED = Map.of(
@@ -415,43 +436,57 @@ jobs:
                           SETTINGS.put(context.player().getUUID(),
                                   new Settings(payload.enabled(), SmeltMode.byId(payload.mode()))));
 
-                  PlayerBlockBreakEvents.AFTER.register(SmeltLogic::onBreak);
+                  // Игрок собирается сломать блок (BEFORE срабатывает и для блоков внутри жилы у большинства Vein Miner).
+                  PlayerBlockBreakEvents.BEFORE.register(SmeltLogic::onBeforeBreak);
+
+                  // Предмет появился в мире: если он рядом со сломанной рудой - подменяем сразу.
+                  ServerEntityEvents.ENTITY_LOAD.register((entity, level) -> {
+                      if (!ARMED.isEmpty() && entity instanceof ItemEntity itemEntity) {
+                          trySmeltNearArmed(itemEntity);
+                      }
+                  });
 
                   ServerTickEvents.END_SERVER_TICK.register(server -> {
-                      if (PENDING.isEmpty()) {
+                      if (ARMED.isEmpty()) {
                           return;
                       }
-                      for (Pending pending : PENDING) {
-                          smeltDrops(pending.level(), pending.pos());
+                      for (Armed armed : ARMED.values()) {
+                          sweep(armed);
                       }
-                      PENDING.clear();
+                      ARMED.clear();
                   });
 
                   ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
                       SETTINGS.clear();
-                      PENDING.clear();
+                      ARMED.clear();
                   });
               }
 
-              private static void onBreak(Level level, Player player, BlockPos pos, BlockState state, BlockEntity blockEntity) {
+              private static boolean onBeforeBreak(Level level, Player player, BlockPos pos, BlockState state, BlockEntity blockEntity) {
                   if (level.isClientSide() || !(player instanceof ServerPlayer serverPlayer)) {
-                      return;
+                      return true;
                   }
 
                   Settings settings = SETTINGS.get(serverPlayer.getUUID());
                   if (settings == null || !settings.enabled()) {
-                      return;
+                      return true;
                   }
                   if (settings.mode() == SmeltMode.SNEAK && !serverPlayer.isShiftKeyDown()) {
-                      return;
+                      return true;
                   }
                   if (!isOre(state)) {
-                      return;
+                      return true;
                   }
 
-                  BlockPos fixed = pos.immutable();
-                  smeltDrops(level, fixed);
-                  PENDING.add(new Pending(level, fixed));
+                  Armed armed = ARMED.get(serverPlayer.getUUID());
+                  if (armed == null || armed.level != level) {
+                      armed = new Armed(level);
+                      ARMED.put(serverPlayer.getUUID(), armed);
+                  }
+                  if (armed.positions.size() < MAX_POSITIONS) {
+                      armed.positions.add(pos.immutable());
+                  }
+                  return true; // ничего не отменяем - решение о ломании блока остаётся за остальными модами
               }
 
               /** Руда: любой блок с id вида "*_ore" (в том числе из других модов) и древние обломки. */
@@ -460,10 +495,48 @@ jobs:
                   return path.endsWith("_ore") || path.equals("ancient_debris");
               }
 
-              /** Подменяет только что выпавшие предметы вокруг блока на переплавленные. */
-              private static void smeltDrops(Level level, BlockPos pos) {
-                  AABB area = new AABB(pos).inflate(2.0);
-                  for (Entity entity : level.getEntities((Entity) null, area,
+              private static void trySmeltNearArmed(ItemEntity itemEntity) {
+                  Item result = SMELTED.get(itemEntity.getItem().getItem());
+                  if (result == null) {
+                      return;
+                  }
+                  for (Armed armed : ARMED.values()) {
+                      if (armed.level != itemEntity.level()) {
+                          continue;
+                      }
+                      for (BlockPos pos : armed.positions) {
+                          double dx = itemEntity.getX() - (pos.getX() + 0.5);
+                          double dy = itemEntity.getY() - (pos.getY() + 0.5);
+                          double dz = itemEntity.getZ() - (pos.getZ() + 0.5);
+                          if (dx * dx + dy * dy + dz * dz <= DROP_RADIUS_SQ) {
+                              itemEntity.setItem(new ItemStack(result, itemEntity.getItem().getCount()));
+                              return;
+                          }
+                      }
+                  }
+              }
+
+              /** Запасной вариант: в конце тика подменяем свежие предметы вокруг всех сломанных блоков игрока. */
+              private static void sweep(Armed armed) {
+                  if (armed.positions.isEmpty()) {
+                      return;
+                  }
+                  int minX = Integer.MAX_VALUE;
+                  int minY = Integer.MAX_VALUE;
+                  int minZ = Integer.MAX_VALUE;
+                  int maxX = Integer.MIN_VALUE;
+                  int maxY = Integer.MIN_VALUE;
+                  int maxZ = Integer.MIN_VALUE;
+                  for (BlockPos pos : armed.positions) {
+                      minX = Math.min(minX, pos.getX());
+                      minY = Math.min(minY, pos.getY());
+                      minZ = Math.min(minZ, pos.getZ());
+                      maxX = Math.max(maxX, pos.getX());
+                      maxY = Math.max(maxY, pos.getY());
+                      maxZ = Math.max(maxZ, pos.getZ());
+                  }
+                  AABB area = new AABB(minX, minY, minZ, maxX + 1, maxY + 1, maxZ + 1).inflate(3.0);
+                  for (Entity entity : armed.level.getEntities((Entity) null, area,
                           e -> e instanceof ItemEntity item && item.tickCount <= 5)) {
                       ItemEntity itemEntity = (ItemEntity) entity;
                       ItemStack stack = itemEntity.getItem();
