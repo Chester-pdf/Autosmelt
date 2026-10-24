@@ -1,0 +1,587 @@
+name: build
+
+# Самодостаточный workflow: весь код мода встроен в этот файл.
+# Положите его в .github/workflows/build.yml пустого репозитория и запустите (Actions -> build -> Run workflow).
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.7.0
+
+      - name: Generate mod project
+        run: |
+          cat > 'gradle.properties' <<'AUTOSMELT_EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          org.gradle.configuration-cache=false
+
+          # Fabric (https://fabricmc.net/develop)
+          minecraft_version=26.2
+          loader_version=0.19.5
+          loom_version=1.18.4
+          fabric_api_version=0.161.0+26.2
+
+          # Мод
+          mod_version=1.0.0
+          maven_group=com.autosmelt
+          archives_base_name=autosmelt
+          AUTOSMELT_EOF
+          cat > 'settings.gradle' <<'AUTOSMELT_EOF'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          AUTOSMELT_EOF
+          cat > 'build.gradle' <<'AUTOSMELT_EOF'
+          plugins {
+              id 'net.fabricmc.fabric-loom' version "${loom_version}"
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+          }
+
+          loom {
+              splitEnvironmentSourceSets()
+
+              mods {
+                  "autosmelt" {
+                      sourceSet sourceSets.main
+                      sourceSet sourceSets.client
+                  }
+              }
+          }
+
+          dependencies {
+              // Minecraft 26.x не обфусцирован: маппинги и remap не нужны
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 25
+              it.options.encoding = "UTF-8"
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_25
+              targetCompatibility = JavaVersion.VERSION_25
+          }
+          AUTOSMELT_EOF
+          mkdir -p 'src/client/java/com/autosmelt/client'
+          cat > 'src/client/java/com/autosmelt/client/AutoSmeltClient.java' <<'AUTOSMELT_EOF'
+          package com.autosmelt.client;
+
+          import com.autosmelt.AutoSmelt;
+          import com.autosmelt.SettingsPayload;
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+          import net.minecraft.client.KeyMapping;
+          import org.lwjgl.glfw.GLFW;
+
+          public class AutoSmeltClient implements ClientModInitializer {
+              private static KeyMapping openKey;
+
+              /** Отправляет текущие настройки на сервер (если на сервере установлен мод). */
+              public static void sendSettings() {
+                  if (ClientPlayNetworking.canSend(SettingsPayload.TYPE)) {
+                      ClientPlayNetworking.send(new SettingsPayload(ClientConfig.enabled, ClientConfig.mode.ordinal()));
+                  }
+              }
+
+              @Override
+              public void onInitializeClient() {
+                  ClientConfig.load();
+
+                  KeyMapping.Category category = KeyMapping.Category.register(AutoSmelt.id("main"));
+
+                  openKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                          "key.autosmelt.open",
+                          InputConstants.Type.KEYSYM,
+                          GLFW.GLFW_KEY_J,
+                          category));
+
+                  // При входе в мир сервер ещё ничего не знает о наших настройках - отправляем.
+                  ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> sendSettings());
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      if (client.player == null) {
+                          return;
+                      }
+                      while (openKey.consumeClick()) {
+                          if (client.gui.screen() == null) {
+                              client.gui.setScreen(new AutoSmeltScreen());
+                          }
+                      }
+                  });
+              }
+          }
+          AUTOSMELT_EOF
+          mkdir -p 'src/client/java/com/autosmelt/client'
+          cat > 'src/client/java/com/autosmelt/client/AutoSmeltScreen.java' <<'AUTOSMELT_EOF'
+          package com.autosmelt.client;
+
+          import com.autosmelt.SmeltMode;
+          import net.minecraft.client.gui.GuiGraphicsExtractor;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+
+          /** Меню авто-переплавки: включить/выключить и выбрать режим (всегда / только при приседании). */
+          public class AutoSmeltScreen extends Screen {
+              private Button toggleButton;
+              private Button modeButton;
+
+              public AutoSmeltScreen() {
+                  super(Component.translatable("autosmelt.menu.title"));
+              }
+
+              private int top() {
+                  return this.height / 2 - 62;
+              }
+
+              @Override
+              protected void init() {
+                  int cx = this.width / 2;
+                  int top = top();
+
+                  this.toggleButton = this.addRenderableWidget(Button.builder(toggleLabel(), b -> {
+                      ClientConfig.enabled = !ClientConfig.enabled;
+                      changed();
+                  }).bounds(cx - 100, top + 20, 200, 20).build());
+
+                  this.modeButton = this.addRenderableWidget(Button.builder(modeLabel(), b -> {
+                      ClientConfig.mode = ClientConfig.mode.next();
+                      changed();
+                  }).bounds(cx - 100, top + 46, 200, 20).build());
+
+                  this.addRenderableWidget(Button.builder(Component.translatable("autosmelt.menu.done"), b -> this.onClose())
+                          .bounds(cx - 100, top + 112, 200, 20).build());
+
+                  this.modeButton.active = ClientConfig.enabled;
+              }
+
+              private Component toggleLabel() {
+                  Component state = ClientConfig.enabled
+                          ? Component.translatable("autosmelt.on").withColor(0x55FF55)
+                          : Component.translatable("autosmelt.off").withColor(0xFF5555);
+                  return Component.translatable("autosmelt.menu.enabled", state);
+              }
+
+              private Component modeLabel() {
+                  return Component.translatable("autosmelt.menu.mode",
+                          Component.translatable("autosmelt.mode." + ClientConfig.mode.name().toLowerCase()));
+              }
+
+              /** Любое изменение сохраняется на диск и сразу отправляется на сервер. */
+              private void changed() {
+                  ClientConfig.save();
+                  AutoSmeltClient.sendSettings();
+                  this.toggleButton.setMessage(toggleLabel());
+                  this.modeButton.setMessage(modeLabel());
+                  this.modeButton.active = ClientConfig.enabled;
+              }
+
+              @Override
+              public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
+                  super.extractRenderState(graphics, mouseX, mouseY, delta);
+
+                  int cx = this.width / 2;
+                  int top = top();
+
+                  drawCentered(graphics, this.title.getString(), cx, top, 0xFFFFFFFF);
+
+                  String hintKey = ClientConfig.mode == SmeltMode.SNEAK ? "autosmelt.menu.hint.sneak" : "autosmelt.menu.hint.always";
+                  drawCentered(graphics, Component.translatable(hintKey).getString(), cx, top + 76, 0xFFA0A0A0);
+                  drawCentered(graphics, Component.translatable("autosmelt.menu.hint.ores").getString(), cx, top + 90, 0xFFA0A0A0);
+              }
+
+              private void drawCentered(GuiGraphicsExtractor graphics, String text, int centerX, int y, int color) {
+                  graphics.text(this.font, text, centerX - this.font.width(text) / 2, y, color, true);
+              }
+          }
+          AUTOSMELT_EOF
+          mkdir -p 'src/client/java/com/autosmelt/client'
+          cat > 'src/client/java/com/autosmelt/client/ClientConfig.java' <<'AUTOSMELT_EOF'
+          package com.autosmelt.client;
+
+          import com.autosmelt.SmeltMode;
+          import java.io.IOException;
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.Locale;
+          import java.util.Properties;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          /** Настройки игрока на клиенте: файл config/autosmelt.properties. */
+          public final class ClientConfig {
+              public static boolean enabled = true;
+              public static SmeltMode mode = SmeltMode.ALWAYS;
+
+              private ClientConfig() {
+              }
+
+              private static Path file() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("autosmelt.properties");
+              }
+
+              public static void load() {
+                  Path path = file();
+                  if (!Files.exists(path)) {
+                      return;
+                  }
+                  Properties props = new Properties();
+                  try (Reader reader = Files.newBufferedReader(path)) {
+                      props.load(reader);
+                  } catch (IOException e) {
+                      return;
+                  }
+                  enabled = Boolean.parseBoolean(props.getProperty("enabled", "true"));
+                  try {
+                      mode = SmeltMode.valueOf(props.getProperty("mode", "ALWAYS").trim().toUpperCase(Locale.ROOT));
+                  } catch (IllegalArgumentException e) {
+                      mode = SmeltMode.ALWAYS;
+                  }
+              }
+
+              public static void save() {
+                  Properties props = new Properties();
+                  props.setProperty("enabled", Boolean.toString(enabled));
+                  props.setProperty("mode", mode.name());
+                  try (Writer writer = Files.newBufferedWriter(file())) {
+                      props.store(writer, "Auto Smelt: mode = ALWAYS or SNEAK");
+                  } catch (IOException e) {
+                      // не критично: настройки просто не сохранятся на диск
+                  }
+              }
+          }
+          AUTOSMELT_EOF
+          mkdir -p 'src/main/java/com/autosmelt'
+          cat > 'src/main/java/com/autosmelt/AutoSmelt.java' <<'AUTOSMELT_EOF'
+          package com.autosmelt;
+
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+          import net.minecraft.resources.Identifier;
+
+          public class AutoSmelt implements ModInitializer {
+              public static final String MOD_ID = "autosmelt";
+
+              public static Identifier id(String path) {
+                  return Identifier.fromNamespaceAndPath(MOD_ID, path);
+              }
+
+              @Override
+              public void onInitialize() {
+                  PayloadTypeRegistry.serverboundPlay().register(SettingsPayload.TYPE, SettingsPayload.CODEC);
+                  SmeltLogic.register();
+              }
+          }
+          AUTOSMELT_EOF
+          mkdir -p 'src/main/java/com/autosmelt'
+          cat > 'src/main/java/com/autosmelt/SettingsPayload.java' <<'AUTOSMELT_EOF'
+          package com.autosmelt;
+
+          import net.minecraft.network.RegistryFriendlyByteBuf;
+          import net.minecraft.network.codec.ByteBufCodecs;
+          import net.minecraft.network.codec.StreamCodec;
+          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+
+          /**
+           * Клиент -> сервер: настройки игрока (отправляются при входе в мир и при каждом изменении в меню).
+           *
+           * @param enabled включена ли авто-переплавка
+           * @param mode    {@link SmeltMode#ordinal()}
+           */
+          public record SettingsPayload(boolean enabled, int mode) implements CustomPacketPayload {
+
+              public static final CustomPacketPayload.Type<SettingsPayload> TYPE =
+                      new CustomPacketPayload.Type<>(AutoSmelt.id("settings"));
+
+              public static final StreamCodec<RegistryFriendlyByteBuf, SettingsPayload> CODEC = StreamCodec.composite(
+                      ByteBufCodecs.BOOL, SettingsPayload::enabled,
+                      ByteBufCodecs.VAR_INT, SettingsPayload::mode,
+                      SettingsPayload::new);
+
+              @Override
+              public CustomPacketPayload.Type<? extends CustomPacketPayload> type() {
+                  return TYPE;
+              }
+          }
+          AUTOSMELT_EOF
+          mkdir -p 'src/main/java/com/autosmelt'
+          cat > 'src/main/java/com/autosmelt/SmeltLogic.java' <<'AUTOSMELT_EOF'
+          package com.autosmelt;
+
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.UUID;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+          import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.registries.BuiltInRegistries;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.entity.item.ItemEntity;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.item.Item;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.item.Items;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.level.block.entity.BlockEntity;
+          import net.minecraft.world.level.block.state.BlockState;
+          import net.minecraft.world.phys.AABB;
+
+          /**
+           * Серверная логика: когда игрок ломает руду, выпавшие предметы подменяются на переплавленные.
+           *
+           * Настройки игроков приходят от клиента ({@link SettingsPayload}) и хранятся только в памяти:
+           * клиент отправляет их заново при каждом входе в мир.
+           */
+          public final class SmeltLogic {
+              private record Settings(boolean enabled, SmeltMode mode) {
+              }
+
+              private record Pending(Level level, BlockPos pos) {
+              }
+
+              private static final Map<UUID, Settings> SETTINGS = new HashMap<>();
+
+              /** Блоки, сломанные в этом тике: дроп подменяем ещё раз в конце тика (на случай, если он появился позже события). */
+              private static final List<Pending> PENDING = new ArrayList<>();
+
+              /** Что во что переплавляется. Руды с Silk Touch (сам блок руды) не трогаем. */
+              private static final Map<Item, Item> SMELTED = Map.of(
+                      Items.RAW_IRON, Items.IRON_INGOT,
+                      Items.RAW_COPPER, Items.COPPER_INGOT,
+                      Items.RAW_GOLD, Items.GOLD_INGOT,
+                      Items.ANCIENT_DEBRIS, Items.NETHERITE_SCRAP);
+
+              private SmeltLogic() {
+              }
+
+              public static void register() {
+                  ServerPlayNetworking.registerGlobalReceiver(SettingsPayload.TYPE, (payload, context) ->
+                          SETTINGS.put(context.player().getUUID(),
+                                  new Settings(payload.enabled(), SmeltMode.byId(payload.mode()))));
+
+                  PlayerBlockBreakEvents.AFTER.register(SmeltLogic::onBreak);
+
+                  ServerTickEvents.END_SERVER_TICK.register(server -> {
+                      if (PENDING.isEmpty()) {
+                          return;
+                      }
+                      for (Pending pending : PENDING) {
+                          smeltDrops(pending.level(), pending.pos());
+                      }
+                      PENDING.clear();
+                  });
+
+                  ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
+                      SETTINGS.clear();
+                      PENDING.clear();
+                  });
+              }
+
+              private static void onBreak(Level level, Player player, BlockPos pos, BlockState state, BlockEntity blockEntity) {
+                  if (level.isClientSide() || !(player instanceof ServerPlayer serverPlayer)) {
+                      return;
+                  }
+
+                  Settings settings = SETTINGS.get(serverPlayer.getUUID());
+                  if (settings == null || !settings.enabled()) {
+                      return;
+                  }
+                  if (settings.mode() == SmeltMode.SNEAK && !serverPlayer.isShiftKeyDown()) {
+                      return;
+                  }
+                  if (!isOre(state)) {
+                      return;
+                  }
+
+                  BlockPos fixed = pos.immutable();
+                  smeltDrops(level, fixed);
+                  PENDING.add(new Pending(level, fixed));
+              }
+
+              /** Руда: любой блок с id вида "*_ore" (в том числе из других модов) и древние обломки. */
+              private static boolean isOre(BlockState state) {
+                  String path = BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath();
+                  return path.endsWith("_ore") || path.equals("ancient_debris");
+              }
+
+              /** Подменяет только что выпавшие предметы вокруг блока на переплавленные. */
+              private static void smeltDrops(Level level, BlockPos pos) {
+                  AABB area = new AABB(pos).inflate(2.0);
+                  for (Entity entity : level.getEntities((Entity) null, area,
+                          e -> e instanceof ItemEntity item && item.tickCount <= 5)) {
+                      ItemEntity itemEntity = (ItemEntity) entity;
+                      ItemStack stack = itemEntity.getItem();
+                      Item result = SMELTED.get(stack.getItem());
+                      if (result != null) {
+                          itemEntity.setItem(new ItemStack(result, stack.getCount()));
+                      }
+                  }
+              }
+          }
+          AUTOSMELT_EOF
+          mkdir -p 'src/main/java/com/autosmelt'
+          cat > 'src/main/java/com/autosmelt/SmeltMode.java' <<'AUTOSMELT_EOF'
+          package com.autosmelt;
+
+          /** Когда работает авто-переплавка. */
+          public enum SmeltMode {
+              /** Всегда. */
+              ALWAYS,
+              /** Только пока игрок приседает (Sneak). */
+              SNEAK;
+
+              public static SmeltMode byId(int id) {
+                  SmeltMode[] values = values();
+                  return values[Math.floorMod(id, values.length)];
+              }
+
+              public SmeltMode next() {
+                  return byId(ordinal() + 1);
+              }
+          }
+          AUTOSMELT_EOF
+          mkdir -p 'src/main/resources/assets/autosmelt/lang'
+          cat > 'src/main/resources/assets/autosmelt/lang/en_us.json' <<'AUTOSMELT_EOF'
+          {
+            "key.autosmelt.open": "Open auto-smelt menu",
+            "key.category.autosmelt.main": "Auto Smelt",
+
+            "autosmelt.menu.title": "Ore Auto-Smelting",
+            "autosmelt.menu.enabled": "Auto-smelt: %s",
+            "autosmelt.menu.mode": "Mode: %s",
+            "autosmelt.menu.done": "Done",
+            "autosmelt.on": "On",
+            "autosmelt.off": "Off",
+
+            "autosmelt.mode.always": "Always",
+            "autosmelt.mode.sneak": "Sneak",
+
+            "autosmelt.menu.hint.always": "Ores are smelted whenever you mine them.",
+            "autosmelt.menu.hint.sneak": "Ores are smelted only while you are sneaking (Shift).",
+            "autosmelt.menu.hint.ores": "Iron, copper, gold and ancient debris."
+          }
+          AUTOSMELT_EOF
+          mkdir -p 'src/main/resources/assets/autosmelt/lang'
+          cat > 'src/main/resources/assets/autosmelt/lang/ru_ru.json' <<'AUTOSMELT_EOF'
+          {
+            "key.autosmelt.open": "Открыть меню авто-переплавки",
+            "key.category.autosmelt.main": "Auto Smelt",
+
+            "autosmelt.menu.title": "Авто-переплавка руды",
+            "autosmelt.menu.enabled": "Авто-переплавка: %s",
+            "autosmelt.menu.mode": "Режим: %s",
+            "autosmelt.menu.done": "Готово",
+            "autosmelt.on": "Вкл",
+            "autosmelt.off": "Выкл",
+
+            "autosmelt.mode.always": "Всегда",
+            "autosmelt.mode.sneak": "Sneak (приседание)",
+
+            "autosmelt.menu.hint.always": "Руда переплавляется при любой добыче.",
+            "autosmelt.menu.hint.sneak": "Руда переплавляется, только пока вы приседаете (Shift).",
+            "autosmelt.menu.hint.ores": "Железо, медь, золото и древние обломки."
+          }
+          AUTOSMELT_EOF
+          mkdir -p 'src/main/resources'
+          cat > 'src/main/resources/fabric.mod.json' <<'AUTOSMELT_EOF'
+          {
+            "schemaVersion": 1,
+            "id": "autosmelt",
+            "version": "${version}",
+            "name": "Auto Smelt",
+            "description": "Авто-переплавка руды при добыче. Меню настройки с двумя режимами: всегда или только при приседании (sneak).",
+            "authors": [],
+            "license": "MIT",
+            "environment": "*",
+            "entrypoints": {
+              "main": [
+                "com.autosmelt.AutoSmelt"
+              ],
+              "client": [
+                "com.autosmelt.client.AutoSmeltClient"
+              ]
+            },
+            "depends": {
+              "fabricloader": ">=0.19.3",
+              "minecraft": "~26.2",
+              "java": ">=25",
+              "fabric-api": "*"
+            }
+          }
+          AUTOSMELT_EOF
+
+      - name: Build
+        run: gradle build --stacktrace
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: autosmelt
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
+
+      # При пуше тега вида v1.0.0 jar прикрепляется к GitHub Release
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
