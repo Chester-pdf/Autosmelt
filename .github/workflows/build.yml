@@ -2,6 +2,7 @@ name: build
 
 # Самодостаточный workflow: весь код мода встроен в этот файл.
 # Положите его в .github/workflows/build.yml пустого репозитория и запустите (Actions -> build -> Run workflow).
+# Этап 1: рабочий каркас + редактор слотов (хоткей K). Миксины на размер инвентаря добавим на этапе 2.
 
 on:
   push:
@@ -27,7 +28,7 @@ jobs:
 
       - name: Generate mod project
         run: |
-          cat > 'gradle.properties' <<'AUTOSMELT_EOF'
+          cat > 'gradle.properties' <<'BIGSLOTS_EOF'
           org.gradle.jvmargs=-Xmx2G
           org.gradle.parallel=true
           org.gradle.configuration-cache=false
@@ -40,10 +41,10 @@ jobs:
 
           # Мод
           mod_version=1.0.0
-          maven_group=com.autosmelt
-          archives_base_name=autosmelt
-          AUTOSMELT_EOF
-          cat > 'settings.gradle' <<'AUTOSMELT_EOF'
+          maven_group=com.bigslots
+          archives_base_name=bigslots
+          BIGSLOTS_EOF
+          cat > 'settings.gradle' <<'BIGSLOTS_EOF'
           pluginManagement {
               repositories {
                   maven {
@@ -54,8 +55,8 @@ jobs:
                   gradlePluginPortal()
               }
           }
-          AUTOSMELT_EOF
-          cat > 'build.gradle' <<'AUTOSMELT_EOF'
+          BIGSLOTS_EOF
+          cat > 'build.gradle' <<'BIGSLOTS_EOF'
           plugins {
               id 'net.fabricmc.fabric-loom' version "${loom_version}"
               id 'maven-publish'
@@ -75,7 +76,7 @@ jobs:
               splitEnvironmentSourceSets()
 
               mods {
-                  "autosmelt" {
+                  "bigslots" {
                       sourceSet sourceSets.main
                       sourceSet sourceSets.client
                   }
@@ -107,168 +108,52 @@ jobs:
               sourceCompatibility = JavaVersion.VERSION_25
               targetCompatibility = JavaVersion.VERSION_25
           }
-          AUTOSMELT_EOF
-          mkdir -p 'src/client/java/com/autosmelt/client'
-          cat > 'src/client/java/com/autosmelt/client/AutoSmeltClient.java' <<'AUTOSMELT_EOF'
-          package com.autosmelt.client;
+          BIGSLOTS_EOF
+          mkdir -p 'src/main/java/com/bigslots'
+          cat > 'src/main/java/com/bigslots/BigSlots.java' <<'BIGSLOTS_EOF'
+          package com.bigslots;
 
-          import com.autosmelt.AutoSmelt;
-          import com.autosmelt.SettingsPayload;
-          import com.mojang.blaze3d.platform.InputConstants;
-          import net.fabricmc.api.ClientModInitializer;
-          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-          import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
-          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
-          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
-          import net.minecraft.client.KeyMapping;
-          import org.lwjgl.glfw.GLFW;
+          import net.fabricmc.api.ModInitializer;
+          import net.minecraft.resources.Identifier;
 
-          public class AutoSmeltClient implements ClientModInitializer {
-              private static KeyMapping openKey;
+          public class BigSlots implements ModInitializer {
+              public static final String MOD_ID = "bigslots";
 
-              /** Отправляет текущие настройки на сервер (если на сервере установлен мод). */
-              public static void sendSettings() {
-                  if (ClientPlayNetworking.canSend(SettingsPayload.TYPE)) {
-                      ClientPlayNetworking.send(new SettingsPayload(ClientConfig.enabled, ClientConfig.mode.ordinal()));
-                  }
+              public static Identifier id(String path) {
+                  return Identifier.fromNamespaceAndPath(MOD_ID, path);
               }
 
               @Override
-              public void onInitializeClient() {
-                  ClientConfig.load();
-
-                  KeyMapping.Category category = KeyMapping.Category.register(AutoSmelt.id("main"));
-
-                  openKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
-                          "key.autosmelt.open",
-                          InputConstants.Type.KEYSYM,
-                          GLFW.GLFW_KEY_J,
-                          category));
-
-                  // При входе в мир сервер ещё ничего не знает о наших настройках - отправляем.
-                  ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> sendSettings());
-
-                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
-                      if (client.player == null) {
-                          return;
-                      }
-                      while (openKey.consumeClick()) {
-                          if (client.gui.screen() == null) {
-                              client.gui.setScreen(new AutoSmeltScreen());
-                          }
-                      }
-                  });
+              public void onInitialize() {
+                  // Этап 2: здесь появится логика расширенного инвентаря
               }
           }
-          AUTOSMELT_EOF
-          mkdir -p 'src/client/java/com/autosmelt/client'
-          cat > 'src/client/java/com/autosmelt/client/AutoSmeltScreen.java' <<'AUTOSMELT_EOF'
-          package com.autosmelt.client;
+          BIGSLOTS_EOF
+          mkdir -p 'src/client/java/com/bigslots/client'
+          cat > 'src/client/java/com/bigslots/client/SlotLayout.java' <<'BIGSLOTS_EOF'
+          package com.bigslots.client;
 
-          import com.autosmelt.SmeltMode;
-          import net.minecraft.client.gui.GuiGraphicsExtractor;
-          import net.minecraft.client.gui.components.Button;
-          import net.minecraft.client.gui.screens.Screen;
-          import net.minecraft.network.chat.Component;
-
-          /** Меню авто-переплавки: включить/выключить и выбрать режим (всегда / только при приседании). */
-          public class AutoSmeltScreen extends Screen {
-              private Button toggleButton;
-              private Button modeButton;
-
-              public AutoSmeltScreen() {
-                  super(Component.translatable("autosmelt.menu.title"));
-              }
-
-              private int top() {
-                  return this.height / 2 - 62;
-              }
-
-              @Override
-              protected void init() {
-                  int cx = this.width / 2;
-                  int top = top();
-
-                  this.toggleButton = this.addRenderableWidget(Button.builder(toggleLabel(), b -> {
-                      ClientConfig.enabled = !ClientConfig.enabled;
-                      changed();
-                  }).bounds(cx - 100, top + 20, 200, 20).build());
-
-                  this.modeButton = this.addRenderableWidget(Button.builder(modeLabel(), b -> {
-                      ClientConfig.mode = ClientConfig.mode.next();
-                      changed();
-                  }).bounds(cx - 100, top + 46, 200, 20).build());
-
-                  this.addRenderableWidget(Button.builder(Component.translatable("autosmelt.menu.done"), b -> this.onClose())
-                          .bounds(cx - 100, top + 112, 200, 20).build());
-
-                  this.modeButton.active = ClientConfig.enabled;
-              }
-
-              private Component toggleLabel() {
-                  Component state = ClientConfig.enabled
-                          ? Component.translatable("autosmelt.on").withColor(0x55FF55)
-                          : Component.translatable("autosmelt.off").withColor(0xFF5555);
-                  return Component.translatable("autosmelt.menu.enabled", state);
-              }
-
-              private Component modeLabel() {
-                  return Component.translatable("autosmelt.menu.mode",
-                          Component.translatable("autosmelt.mode." + ClientConfig.mode.name().toLowerCase()));
-              }
-
-              /** Любое изменение сохраняется на диск и сразу отправляется на сервер. */
-              private void changed() {
-                  ClientConfig.save();
-                  AutoSmeltClient.sendSettings();
-                  this.toggleButton.setMessage(toggleLabel());
-                  this.modeButton.setMessage(modeLabel());
-                  this.modeButton.active = ClientConfig.enabled;
-              }
-
-              @Override
-              public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
-                  super.extractRenderState(graphics, mouseX, mouseY, delta);
-
-                  int cx = this.width / 2;
-                  int top = top();
-
-                  drawCentered(graphics, this.title.getString(), cx, top, 0xFFFFFFFF);
-
-                  String hintKey = ClientConfig.mode == SmeltMode.SNEAK ? "autosmelt.menu.hint.sneak" : "autosmelt.menu.hint.always";
-                  drawCentered(graphics, Component.translatable(hintKey).getString(), cx, top + 76, 0xFFA0A0A0);
-                  drawCentered(graphics, Component.translatable("autosmelt.menu.hint.ores").getString(), cx, top + 90, 0xFFA0A0A0);
-              }
-
-              private void drawCentered(GuiGraphicsExtractor graphics, String text, int centerX, int y, int color) {
-                  graphics.text(this.font, text, centerX - this.font.width(text) / 2, y, color, true);
-              }
-          }
-          AUTOSMELT_EOF
-          mkdir -p 'src/client/java/com/autosmelt/client'
-          cat > 'src/client/java/com/autosmelt/client/ClientConfig.java' <<'AUTOSMELT_EOF'
-          package com.autosmelt.client;
-
-          import com.autosmelt.SmeltMode;
           import java.io.IOException;
           import java.io.Reader;
           import java.io.Writer;
           import java.nio.file.Files;
           import java.nio.file.Path;
-          import java.util.Locale;
           import java.util.Properties;
           import net.fabricmc.loader.api.FabricLoader;
 
-          /** Настройки игрока на клиенте: файл config/autosmelt.properties. */
-          public final class ClientConfig {
-              public static boolean enabled = true;
-              public static SmeltMode mode = SmeltMode.ALWAYS;
+          /** Раскладка дополнительных слотов: сетка ROWS x COLS, true = слот включён. Файл config/bigslots.properties. */
+          public final class SlotLayout {
+              public static final int ROWS = 4;
+              public static final int COLS = 9;
+              public static final int SIZE = ROWS * COLS;
 
-              private ClientConfig() {
+              public static final boolean[] enabled = new boolean[SIZE];
+
+              private SlotLayout() {
               }
 
               private static Path file() {
-                  return FabricLoader.getInstance().getConfigDir().resolve("autosmelt.properties");
+                  return FabricLoader.getInstance().getConfigDir().resolve("bigslots.properties");
               }
 
               public static void load() {
@@ -282,352 +167,207 @@ jobs:
                   } catch (IOException e) {
                       return;
                   }
-                  enabled = Boolean.parseBoolean(props.getProperty("enabled", "true"));
-                  try {
-                      mode = SmeltMode.valueOf(props.getProperty("mode", "ALWAYS").trim().toUpperCase(Locale.ROOT));
-                  } catch (IllegalArgumentException e) {
-                      mode = SmeltMode.ALWAYS;
+                  String s = props.getProperty("layout", "");
+                  for (int i = 0; i < SIZE; i++) {
+                      enabled[i] = i < s.length() && s.charAt(i) == '1';
                   }
               }
 
               public static void save() {
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = 0; i < SIZE; i++) {
+                      sb.append(enabled[i] ? '1' : '0');
+                  }
                   Properties props = new Properties();
-                  props.setProperty("enabled", Boolean.toString(enabled));
-                  props.setProperty("mode", mode.name());
+                  props.setProperty("layout", sb.toString());
                   try (Writer writer = Files.newBufferedWriter(file())) {
-                      props.store(writer, "Auto Smelt: mode = ALWAYS or SNEAK");
+                      props.store(writer, "Big Slots: 1 = slot enabled");
                   } catch (IOException e) {
-                      // не критично: настройки просто не сохранятся на диск
+                      // не критично: раскладка просто не сохранится на диск
                   }
               }
           }
-          AUTOSMELT_EOF
-          mkdir -p 'src/main/java/com/autosmelt'
-          cat > 'src/main/java/com/autosmelt/AutoSmelt.java' <<'AUTOSMELT_EOF'
-          package com.autosmelt;
+          BIGSLOTS_EOF
+          cat > 'src/client/java/com/bigslots/client/SlotEditorScreen.java' <<'BIGSLOTS_EOF'
+          package com.bigslots.client;
 
-          import net.fabricmc.api.ModInitializer;
-          import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
-          import net.minecraft.resources.Identifier;
+          import net.minecraft.client.gui.GuiGraphicsExtractor;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.client.input.MouseButtonEvent;
+          import net.minecraft.network.chat.Component;
 
-          public class AutoSmelt implements ModInitializer {
-              public static final String MOD_ID = "autosmelt";
+          /**
+           * Режим редактирования слотов: всё мигает, обычным инвентарём пользоваться нельзя.
+           * ЛКМ по пустой клетке - добавить слот, ПКМ по слоту - убрать, кнопка "Готово" (ЛКМ) - подтвердить.
+           */
+          public class SlotEditorScreen extends Screen {
+              private static final int CELL = 22;
 
-              public static Identifier id(String path) {
-                  return Identifier.fromNamespaceAndPath(MOD_ID, path);
+              private final boolean[] draft = new boolean[SlotLayout.SIZE];
+              private final Button[] cells = new Button[SlotLayout.SIZE];
+
+              public SlotEditorScreen() {
+                  super(Component.translatable("bigslots.menu.title"));
+                  System.arraycopy(SlotLayout.enabled, 0, draft, 0, draft.length);
+              }
+
+              private int left() {
+                  return this.width / 2 - (SlotLayout.COLS * CELL) / 2;
+              }
+
+              private int top() {
+                  return this.height / 2 - 80;
               }
 
               @Override
-              public void onInitialize() {
-                  PayloadTypeRegistry.serverboundPlay().register(SettingsPayload.TYPE, SettingsPayload.CODEC);
-                  SmeltLogic.register();
+              protected void init() {
+                  int cx = this.width / 2;
+                  for (int i = 0; i < SlotLayout.SIZE; i++) {
+                      final int idx = i;
+                      int col = i % SlotLayout.COLS;
+                      int row = i / SlotLayout.COLS;
+                      Button b = Button.builder(cellLabel(i, true), btn -> {
+                          draft[idx] = true;
+                      }).bounds(left() + col * CELL, top() + 20 + row * CELL, CELL - 2, CELL - 2).build();
+                      cells[i] = this.addRenderableWidget(b);
+                  }
+
+                  int below = top() + 20 + SlotLayout.ROWS * CELL + 8;
+
+                  this.addRenderableWidget(Button.builder(Component.translatable("bigslots.menu.done"), b -> {
+                      System.arraycopy(draft, 0, SlotLayout.enabled, 0, draft.length);
+                      SlotLayout.save();
+                      this.onClose();
+                  }).bounds(cx - 100, below, 98, 20).build());
+
+                  this.addRenderableWidget(Button.builder(Component.translatable("bigslots.menu.cancel"), b -> this.onClose())
+                          .bounds(cx + 2, below, 98, 20).build());
               }
-          }
-          AUTOSMELT_EOF
-          mkdir -p 'src/main/java/com/autosmelt'
-          cat > 'src/main/java/com/autosmelt/SettingsPayload.java' <<'AUTOSMELT_EOF'
-          package com.autosmelt;
 
-          import net.minecraft.network.RegistryFriendlyByteBuf;
-          import net.minecraft.network.codec.ByteBufCodecs;
-          import net.minecraft.network.codec.StreamCodec;
-          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+              private Component cellLabel(int i, boolean bright) {
+                  if (draft[i]) {
+                      return Component.literal("O").withColor(bright ? 0x55FF55 : 0x00AA00);
+                  }
+                  return Component.literal("+").withColor(bright ? 0xFFFFFF : 0x777777);
+              }
 
-          /**
-           * Клиент -> сервер: настройки игрока (отправляются при входе в мир и при каждом изменении в меню).
-           *
-           * @param enabled включена ли авто-переплавка
-           * @param mode    {@link SmeltMode#ordinal()}
-           */
-          public record SettingsPayload(boolean enabled, int mode) implements CustomPacketPayload {
-
-              public static final CustomPacketPayload.Type<SettingsPayload> TYPE =
-                      new CustomPacketPayload.Type<>(AutoSmelt.id("settings"));
-
-              public static final StreamCodec<RegistryFriendlyByteBuf, SettingsPayload> CODEC = StreamCodec.composite(
-                      ByteBufCodecs.BOOL, SettingsPayload::enabled,
-                      ByteBufCodecs.VAR_INT, SettingsPayload::mode,
-                      SettingsPayload::new);
-
+              /** ПКМ по включённому слоту - удалить его (по одному). */
               @Override
-              public CustomPacketPayload.Type<? extends CustomPacketPayload> type() {
-                  return TYPE;
-              }
-          }
-          AUTOSMELT_EOF
-          mkdir -p 'src/main/java/com/autosmelt'
-          cat > 'src/main/java/com/autosmelt/SmeltLogic.java' <<'AUTOSMELT_EOF'
-          package com.autosmelt;
-
-          import java.util.ArrayList;
-          import java.util.HashMap;
-          import java.util.List;
-          import java.util.Map;
-          import java.util.UUID;
-          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
-          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
-          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
-          import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
-          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
-          import net.minecraft.core.BlockPos;
-          import net.minecraft.core.registries.BuiltInRegistries;
-          import net.minecraft.server.level.ServerPlayer;
-          import net.minecraft.world.entity.Entity;
-          import net.minecraft.world.entity.item.ItemEntity;
-          import net.minecraft.world.entity.player.Player;
-          import net.minecraft.world.item.Item;
-          import net.minecraft.world.item.ItemStack;
-          import net.minecraft.world.item.Items;
-          import net.minecraft.world.level.Level;
-          import net.minecraft.world.level.block.entity.BlockEntity;
-          import net.minecraft.world.level.block.state.BlockState;
-          import net.minecraft.world.phys.AABB;
-
-          /**
-           * Серверная логика: когда игрок ломает руду, выпавшие предметы подменяются на переплавленные.
-           *
-           * Совместимость с модами вида Vein Miner (добыча всей жилы за раз):
-           * <ul>
-           * <li>мы не трогаем ломание блоков и не используем миксины, поэтому нечему конфликтовать;</li>
-           * <li>перед КАЖДЫМ сломанным игроком блоком руды (в том числе внутри жилы) запоминаем его позицию;</li>
-           * <li>предмет подменяется в момент появления в мире, ещё до того, как другой мод успеет его подобрать
-           *     или перенести в инвентарь, поэтому переплавляется вся жила;</li>
-           * <li>в конце тика дополнительно проверяем свежие предметы вокруг (на случай, если дроп появился иначе);</li>
-           * <li>подмена идемпотентна: слиток повторно не обрабатывается, двойной переплавки быть не может.</li>
-           * </ul>
-           * Настройки игроков приходят от клиента ({@link SettingsPayload}) и хранятся только в памяти:
-           * клиент отправляет их заново при каждом входе в мир.
-           */
-          public final class SmeltLogic {
-              private record Settings(boolean enabled, SmeltMode mode) {
-              }
-
-              /** Позиции руды, которую игрок ломает в текущем тике. */
-              private static final class Armed {
-                  final Level level;
-                  final List<BlockPos> positions = new ArrayList<>();
-
-                  Armed(Level level) {
-                      this.level = level;
-                  }
-              }
-
-              /** Максимум запомненных блоков на игрока за тик (защита от гигантских жил). */
-              private static final int MAX_POSITIONS = 1024;
-
-              /** Радиус (в блоках), в котором предмет считается дропом от сломанной руды. */
-              private static final double DROP_RADIUS_SQ = 3.0 * 3.0;
-
-              private static final Map<UUID, Settings> SETTINGS = new HashMap<>();
-              private static final Map<UUID, Armed> ARMED = new HashMap<>();
-
-              /** Что во что переплавляется. Руды с Silk Touch (сам блок руды) не трогаем. */
-              private static final Map<Item, Item> SMELTED = Map.of(
-                      Items.RAW_IRON, Items.IRON_INGOT,
-                      Items.RAW_COPPER, Items.COPPER_INGOT,
-                      Items.RAW_GOLD, Items.GOLD_INGOT,
-                      Items.ANCIENT_DEBRIS, Items.NETHERITE_SCRAP);
-
-              private SmeltLogic() {
-              }
-
-              public static void register() {
-                  ServerPlayNetworking.registerGlobalReceiver(SettingsPayload.TYPE, (payload, context) ->
-                          SETTINGS.put(context.player().getUUID(),
-                                  new Settings(payload.enabled(), SmeltMode.byId(payload.mode()))));
-
-                  // Игрок собирается сломать блок (BEFORE срабатывает и для блоков внутри жилы у большинства Vein Miner).
-                  PlayerBlockBreakEvents.BEFORE.register(SmeltLogic::onBeforeBreak);
-
-                  // Предмет появился в мире: если он рядом со сломанной рудой - подменяем сразу.
-                  ServerEntityEvents.ENTITY_LOAD.register((entity, level) -> {
-                      if (!ARMED.isEmpty() && entity instanceof ItemEntity itemEntity) {
-                          trySmeltNearArmed(itemEntity);
-                      }
-                  });
-
-                  ServerTickEvents.END_SERVER_TICK.register(server -> {
-                      if (ARMED.isEmpty()) {
-                          return;
-                      }
-                      for (Armed armed : ARMED.values()) {
-                          sweep(armed);
-                      }
-                      ARMED.clear();
-                  });
-
-                  ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
-                      SETTINGS.clear();
-                      ARMED.clear();
-                  });
-              }
-
-              private static boolean onBeforeBreak(Level level, Player player, BlockPos pos, BlockState state, BlockEntity blockEntity) {
-                  if (level.isClientSide() || !(player instanceof ServerPlayer serverPlayer)) {
-                      return true;
-                  }
-
-                  Settings settings = SETTINGS.get(serverPlayer.getUUID());
-                  if (settings == null || !settings.enabled()) {
-                      return true;
-                  }
-                  if (settings.mode() == SmeltMode.SNEAK && !serverPlayer.isShiftKeyDown()) {
-                      return true;
-                  }
-                  if (!isOre(state)) {
-                      return true;
-                  }
-
-                  Armed armed = ARMED.get(serverPlayer.getUUID());
-                  if (armed == null || armed.level != level) {
-                      armed = new Armed(level);
-                      ARMED.put(serverPlayer.getUUID(), armed);
-                  }
-                  if (armed.positions.size() < MAX_POSITIONS) {
-                      armed.positions.add(pos.immutable());
-                  }
-                  return true; // ничего не отменяем - решение о ломании блока остаётся за остальными модами
-              }
-
-              /** Руда: любой блок с id вида "*_ore" (в том числе из других модов) и древние обломки. */
-              private static boolean isOre(BlockState state) {
-                  String path = BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath();
-                  return path.endsWith("_ore") || path.equals("ancient_debris");
-              }
-
-              private static void trySmeltNearArmed(ItemEntity itemEntity) {
-                  Item result = SMELTED.get(itemEntity.getItem().getItem());
-                  if (result == null) {
-                      return;
-                  }
-                  for (Armed armed : ARMED.values()) {
-                      if (armed.level != itemEntity.level()) {
-                          continue;
-                      }
-                      for (BlockPos pos : armed.positions) {
-                          double dx = itemEntity.getX() - (pos.getX() + 0.5);
-                          double dy = itemEntity.getY() - (pos.getY() + 0.5);
-                          double dz = itemEntity.getZ() - (pos.getZ() + 0.5);
-                          if (dx * dx + dy * dy + dz * dz <= DROP_RADIUS_SQ) {
-                              itemEntity.setItem(new ItemStack(result, itemEntity.getItem().getCount()));
-                              return;
+              public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+                  if (event.button() == 1) {
+                      for (int i = 0; i < cells.length; i++) {
+                          Button b = cells[i];
+                          if (b != null && b.isMouseOver(event.x(), event.y())) {
+                              draft[i] = false;
+                              return true;
                           }
                       }
                   }
+                  return super.mouseClicked(event, doubleClick);
               }
 
-              /** Запасной вариант: в конце тика подменяем свежие предметы вокруг всех сломанных блоков игрока. */
-              private static void sweep(Armed armed) {
-                  if (armed.positions.isEmpty()) {
-                      return;
-                  }
-                  int minX = Integer.MAX_VALUE;
-                  int minY = Integer.MAX_VALUE;
-                  int minZ = Integer.MAX_VALUE;
-                  int maxX = Integer.MIN_VALUE;
-                  int maxY = Integer.MIN_VALUE;
-                  int maxZ = Integer.MIN_VALUE;
-                  for (BlockPos pos : armed.positions) {
-                      minX = Math.min(minX, pos.getX());
-                      minY = Math.min(minY, pos.getY());
-                      minZ = Math.min(minZ, pos.getZ());
-                      maxX = Math.max(maxX, pos.getX());
-                      maxY = Math.max(maxY, pos.getY());
-                      maxZ = Math.max(maxZ, pos.getZ());
-                  }
-                  AABB area = new AABB(minX, minY, minZ, maxX + 1, maxY + 1, maxZ + 1).inflate(3.0);
-                  for (Entity entity : armed.level.getEntities((Entity) null, area,
-                          e -> e instanceof ItemEntity item && item.tickCount <= 5)) {
-                      ItemEntity itemEntity = (ItemEntity) entity;
-                      ItemStack stack = itemEntity.getItem();
-                      Item result = SMELTED.get(stack.getItem());
-                      if (result != null) {
-                          itemEntity.setItem(new ItemStack(result, stack.getCount()));
+              @Override
+              public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
+                  // мигание: переключается несколько раз в секунду
+                  boolean bright = (System.currentTimeMillis() / 350) % 2 == 0;
+                  for (int i = 0; i < cells.length; i++) {
+                      if (cells[i] != null) {
+                          cells[i].setMessage(cellLabel(i, bright));
                       }
                   }
+
+                  super.extractRenderState(graphics, mouseX, mouseY, delta);
+
+                  int cx = this.width / 2;
+                  drawCentered(graphics, this.title.getString(), cx, top(), bright ? 0xFFFFFFFF : 0xFFFFAA00);
+                  drawCentered(graphics, Component.translatable("bigslots.menu.hint").getString(),
+                          cx, top() + 20 + SlotLayout.ROWS * CELL + 34, 0xFFA0A0A0);
+              }
+
+              private void drawCentered(GuiGraphicsExtractor graphics, String text, int centerX, int y, int color) {
+                  graphics.text(this.font, text, centerX - this.font.width(text) / 2, y, color, true);
               }
           }
-          AUTOSMELT_EOF
-          mkdir -p 'src/main/java/com/autosmelt'
-          cat > 'src/main/java/com/autosmelt/SmeltMode.java' <<'AUTOSMELT_EOF'
-          package com.autosmelt;
+          BIGSLOTS_EOF
+          cat > 'src/client/java/com/bigslots/client/BigSlotsClient.java' <<'BIGSLOTS_EOF'
+          package com.bigslots.client;
 
-          /** Когда работает авто-переплавка. */
-          public enum SmeltMode {
-              /** Всегда. */
-              ALWAYS,
-              /** Только пока игрок приседает (Sneak). */
-              SNEAK;
+          import com.bigslots.BigSlots;
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+          import net.minecraft.client.KeyMapping;
+          import org.lwjgl.glfw.GLFW;
 
-              public static SmeltMode byId(int id) {
-                  SmeltMode[] values = values();
-                  return values[Math.floorMod(id, values.length)];
-              }
+          public class BigSlotsClient implements ClientModInitializer {
+              private static KeyMapping editKey;
 
-              public SmeltMode next() {
-                  return byId(ordinal() + 1);
+              @Override
+              public void onInitializeClient() {
+                  SlotLayout.load();
+
+                  KeyMapping.Category category = KeyMapping.Category.register(BigSlots.id("main"));
+
+                  editKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                          "key.bigslots.edit",
+                          InputConstants.Type.KEYSYM,
+                          GLFW.GLFW_KEY_K,
+                          category));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      if (client.player == null) {
+                          return;
+                      }
+                      while (editKey.consumeClick()) {
+                          if (client.gui.screen() == null) {
+                              client.gui.setScreen(new SlotEditorScreen());
+                          }
+                      }
+                  });
               }
           }
-          AUTOSMELT_EOF
-          mkdir -p 'src/main/resources/assets/autosmelt/lang'
-          cat > 'src/main/resources/assets/autosmelt/lang/en_us.json' <<'AUTOSMELT_EOF'
+          BIGSLOTS_EOF
+          mkdir -p 'src/main/resources/assets/bigslots/lang'
+          cat > 'src/main/resources/assets/bigslots/lang/en_us.json' <<'BIGSLOTS_EOF'
           {
-            "key.autosmelt.open": "Open auto-smelt menu",
-            "key.category.autosmelt.main": "Auto Smelt",
+            "key.bigslots.edit": "Edit extra slots",
+            "key.category.bigslots.main": "Big Slots",
 
-            "autosmelt.menu.title": "Ore Auto-Smelting",
-            "autosmelt.menu.enabled": "Auto-smelt: %s",
-            "autosmelt.menu.mode": "Mode: %s",
-            "autosmelt.menu.done": "Done",
-            "autosmelt.on": "On",
-            "autosmelt.off": "Off",
-
-            "autosmelt.mode.always": "Always",
-            "autosmelt.mode.sneak": "Sneak",
-
-            "autosmelt.menu.hint.always": "Ores are smelted whenever you mine them.",
-            "autosmelt.menu.hint.sneak": "Ores are smelted only while you are sneaking (Shift).",
-            "autosmelt.menu.hint.ores": "Iron, copper, gold and ancient debris."
+            "bigslots.menu.title": "Slot editor",
+            "bigslots.menu.done": "Confirm",
+            "bigslots.menu.cancel": "Cancel",
+            "bigslots.menu.hint": "LMB on + : add slot. RMB on O : remove slot."
           }
-          AUTOSMELT_EOF
-          mkdir -p 'src/main/resources/assets/autosmelt/lang'
-          cat > 'src/main/resources/assets/autosmelt/lang/ru_ru.json' <<'AUTOSMELT_EOF'
+          BIGSLOTS_EOF
+          cat > 'src/main/resources/assets/bigslots/lang/ru_ru.json' <<'BIGSLOTS_EOF'
           {
-            "key.autosmelt.open": "Открыть меню авто-переплавки",
-            "key.category.autosmelt.main": "Auto Smelt",
+            "key.bigslots.edit": "Редактировать доп. слоты",
+            "key.category.bigslots.main": "Big Slots",
 
-            "autosmelt.menu.title": "Авто-переплавка руды",
-            "autosmelt.menu.enabled": "Авто-переплавка: %s",
-            "autosmelt.menu.mode": "Режим: %s",
-            "autosmelt.menu.done": "Готово",
-            "autosmelt.on": "Вкл",
-            "autosmelt.off": "Выкл",
-
-            "autosmelt.mode.always": "Всегда",
-            "autosmelt.mode.sneak": "Sneak (приседание)",
-
-            "autosmelt.menu.hint.always": "Руда переплавляется при любой добыче.",
-            "autosmelt.menu.hint.sneak": "Руда переплавляется, только пока вы приседаете (Shift).",
-            "autosmelt.menu.hint.ores": "Железо, медь, золото и древние обломки."
+            "bigslots.menu.title": "Редактор слотов",
+            "bigslots.menu.done": "Подтвердить",
+            "bigslots.menu.cancel": "Отмена",
+            "bigslots.menu.hint": "ЛКМ по + : добавить слот. ПКМ по O : удалить слот."
           }
-          AUTOSMELT_EOF
-          mkdir -p 'src/main/resources'
-          cat > 'src/main/resources/fabric.mod.json' <<'AUTOSMELT_EOF'
+          BIGSLOTS_EOF
+          cat > 'src/main/resources/fabric.mod.json' <<'BIGSLOTS_EOF'
           {
             "schemaVersion": 1,
-            "id": "autosmelt",
+            "id": "bigslots",
             "version": "${version}",
-            "name": "Auto Smelt",
-            "description": "Авто-переплавка руды при добыче. Меню настройки с двумя режимами: всегда или только при приседании (sneak).",
+            "name": "Big Slots",
+            "description": "Больше слотов в инвентаре и хотбаре без дополнительных предметов. Редактор слотов по хоткею.",
             "authors": [],
             "license": "MIT",
             "environment": "*",
             "entrypoints": {
               "main": [
-                "com.autosmelt.AutoSmelt"
+                "com.bigslots.BigSlots"
               ],
               "client": [
-                "com.autosmelt.client.AutoSmeltClient"
+                "com.bigslots.client.BigSlotsClient"
               ]
             },
             "depends": {
@@ -637,7 +377,7 @@ jobs:
               "fabric-api": "*"
             }
           }
-          AUTOSMELT_EOF
+          BIGSLOTS_EOF
 
       - name: Build
         run: gradle build --stacktrace
@@ -645,7 +385,7 @@ jobs:
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
-          name: autosmelt
+          name: bigslots
           path: |
             build/libs/*.jar
             !build/libs/*-sources.jar
